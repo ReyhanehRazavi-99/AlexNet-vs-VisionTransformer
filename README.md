@@ -1,4 +1,4 @@
-"# AlexNet-vs-VisionTransformer" 
+# AlexNet-vs-VisionTransformer
 #1. Model Descriptions
 1(a) Architecture Summary
 Introduction
