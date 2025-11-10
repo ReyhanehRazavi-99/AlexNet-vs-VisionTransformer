@@ -280,8 +280,7 @@ This gives comparable train/val sizes to CIFAR-10 and ensures fair cross-model c
 
 
 
-
-# Project: CIFAR-10 Transfer Learning with AlexNet — My Designs, Settings, and Results
+## Project: CIFAR-10 Transfer Learning with AlexNet — My Designs, Settings, and Results
 Dataset & Preprocessing
 
 I used CIFAR-10 (50k train / 10k test; 10 classes). Because AlexNet is pretrained on ImageNet at 224×224, I resized each image to 224×224 and normalized inputs with the standard ImageNet mean/std. For evaluation I used Resize(256) → CenterCrop(224) → ToTensor → Normalize. For training in the fine-tuning settings I added light augmentation (RandomResizedCrop, RandomHorizontalFlip) and, in the full fine-tune, also ColorJitter.
@@ -421,6 +420,9 @@ Weight decay: {1e-4, 5e-4}
 
 Augment (downstream only): baseline (Crop+Flip) vs +ColorJitter vs RandAugment; optionally Mixup α∈{0.1, 0.2} and CutMix β∈{0.5, 1.0} for the fine-tuning settings. 
 CVF Open Access
++2
+arXiv
++2
 
 Frozen features → Linear SVM
 
@@ -475,11 +477,253 @@ I set seed=42 for Python/NumPy/Torch and used pinned memory and num_workers=2 fo
 I logged training/validation curves, stored the best checkpoint by validation accuracy in full FT, and reported test metrics at the best checkpoint.
 
 
+## pipeline 2: alexnet on ferplus
+
+Models and Training Regimes
+
+We evaluated three training regimes using AlexNet pretrained on ImageNet.
+
+Type 1 — Linear Probe (Backbone Frozen, Train Final Layer Only)
+
+Backbone: torchvision.models.alexnet with ImageNet weights.
+Frozen: All layers except the final linear layer (4096 to 8).
+Optimizer: Adam with learning rate 1e-3, no weight decay.
+Loss: Cross-entropy.
+Learning-rate scheduling: ReduceLROnPlateau on 1 - validation accuracy.
+Epochs: 10.
+Input pipeline: Images streamed from Keras ImageDataGenerator, then converted and normalized for ImageNet preprocessing in PyTorch.
+
+Results for Type 1:
+Validation Accuracy: 0.5516
+Test Accuracy: 0.5411
+Per-class performance was strongest for high-support classes such as "neutral" and "happiness." Precision and recall were very low for minority classes (e.g., "contempt," "disgust"), which is typical for a linear probe with class imbalance and limited representational adaptation.
+
+Type 2 — Feature Extraction + Linear SVM
+
+Feature extractor: AlexNet with weights frozen. Output features were avgpool + flatten, producing 9216-dimensional descriptors.
+Classifier: Linear SVM (scikit-learn) wrapped in a pipeline with StandardScaler and class_weight="balanced".
+Training: The SVM was trained on all 9216-D training descriptors and evaluated on the validation and test descriptors.
+
+Results for Type 2:
+Validation Accuracy: 0.5649
+Test Accuracy: 0.6050
+Compared to Type 1, separating representation extraction and classification produced a noticeable improvement, increasing test accuracy by about 6.4 percentage points. Confusion matrices still showed weak performance on minority classes.
+
+Type 3 — End-to-End Fine-Tuning
+
+Backbone: AlexNet (ImageNet). The final fully connected layer was replaced with a new 4096 to 8 classifier.
+Trainable parameters: Entire network was trainable (the option to freeze early convolutional layers was left commented out).
+Loss: Cross-entropy with label smoothing = 0.05.
+Optimizer: AdamW with learning rate 1e-4 and weight decay = 0.01.
+Scheduler: CosineAnnealingLR with Tmax = 10 and eta_min = 1e-6.
+Early stopping: Based on validation loss with patience of 3. Best model stored in alexnet_finetuned_best.pth.
+
+Results for Type 3:
+Validation Accuracy: 0.7966
+Test Accuracy: 0.7986
+This was a major improvement over Types 1 and 2, showing that adapting the entire convolutional representation to FERPlus is essential. The model performed best on "happiness" and "neutral." The "contempt" class still remained weak due to extremely low sample count. Label smoothing likely helped stabilize training.
+
+Post-hoc Classical Classifiers on Embeddings from the Fine-Tuned Model
+
+After fine-tuning, we extracted 4096-D embeddings by cutting AlexNet before the final linear layer. Several classical classifiers were trained on these fixed embeddings.
+
+Linear SVM: Validation 0.7406, Test 0.7487
+Logistic Regression: Validation 0.7328, Test 0.7373
+k-Nearest Neighbors (k = 15, distance weighting): Validation 0.7804, Test 0.7836
+Random Forest (300 trees, balanced_subsample): Validation 0.7943, Test 0.7957 (best classical classifier)
+
+These performance levels were close to the end-to-end model, showing that the fine-tuned embeddings are linearly or semi-linearly separable and highly reusable across different classifiers. PCA and t-SNE plots indicated clearly clustered emotional categories.
+
+Artifacts and Reproducibility
+
+Two fully exportable pipelines were created:
+
+AlexNet + SVM (Type 2):
+svm_alexnet_pipeline.joblib (StandardScaler + linear SVM)
+alexnet_features_scripted.pt (TorchScript feature extractor)
+classes.json and meta.json
+Packaged as alexnet_svm_artifacts.zip
+
+Fine-tuned AlexNet (Type 3):
+alexnet_finetuned_best.pth (best model state_dict)
+alexnet_finetuned_scripted.pt (TorchScript inference graph)
+classes.json and meta.json
+Packaged as alexnet_finetuned_artifacts.zip
+
+Both pipelines support CPU-only inference with consistent preprocessing (RGB to [0,1], ImageNet normalization, resize to 224×224).
+
+Key Results (Single Run)
+
+Type 1 — Linear probe with frozen AlexNet: Validation 0.5516, Test 0.5411
+Type 2 — Frozen AlexNet features + Linear SVM: Validation 0.5649, Test 0.6050
+Type 3 — End-to-end fine-tuning: Validation 0.7966, Test 0.7986
+Type 3 embeddings + Random Forest: Validation 0.7943, Test 0.7957
+Type 3 embeddings + k-NN (k=15): Validation 0.7804, Test 0.7836
+Type 3 embeddings + Linear SVM: Validation 0.7406, Test 0.7487
+Type 3 embeddings + Logistic Regression: Validation 0.7328, Test 0.7373
+
+Dataset: FER2013Plus (8 classes).
+Batch size: 64.
+Validation split: 20 percent from training directory.
+
+Interpretation and Notes
+
+Type 3 substantially outperformed the other methods. The 18–25 percentage point improvement shows that FERPlus requires task-specific adaptation of the convolutional filters because facial expressions contain subtle cues not present in ImageNet.
+
+Minority classes such as "contempt" and "disgust" have very low support in FERPlus, causing unstable precision and recall. Even with label smoothing and class-balanced weighting in classical models, these remain difficult. Techniques such as oversampling, class-balanced loss, focal loss, mixup, or cutmix could further improve those classes.
+
+Type 2 performed better on the test set than on the validation set, likely due to benign directory-level variance rather than overfitting. Type 3 generalized consistently across validation and test.
+
+Data augmentation was moderate and likely contributed to robustness. Stronger augmentation (RandAugment, light color jitter, cutout) may provide additional benefits without distorting facial structure.
+
+Hyperparameters for all three regimes were well chosen for stability and fairness across comparisons.
+
+## Transfer-Learning Setups with DeiT-Base on CIFAR-10
+
+We evaluated three standard transfer-learning regimes using a DeiT-Base (patch-16, 224×224) backbone from timm on CIFAR-10. For all models, we (a) resized images to 224×224 and normalized with ImageNet statistics, (b) used AutoAugment (ImageNet policy), RandomHorizontalFlip, and RandomErasing (p=0.2) for training, (c) trained with mixed precision (autocast + GradScaler), AdamW, cosine learning-rate schedule with warmup, and early stopping on validation loss. The CIFAR-10 training set was split stratified 80/20 into train/validation (40,000/10,000); the official 10,000-image test set was held out for final evaluation. Unless noted, we used label smoothing as specified below.
+
+Type 1 — Linear Probe (Head-Only)
+
+Goal. Assess the discriminative power of frozen DeiT features via a lightweight supervised adapter.
+
+Setup.
+
+Initialize ImageNet-pretrained DeiT-Base; freeze the entire backbone.
+
+Replace the classification head with a fresh linear layer for 10 classes; train only the head.
+
+Batch size = 128, epochs = 30, early stopping patience = 5.
+
+Optimizer/Loss/Schedule. AdamW on head params only (lr = 3e-3, weight decay = 0.0); no label smoothing (0.0). Cosine LR with warmup.
+
+Capacity. Total params: 85,806,346; trainable: 7,690 (head only).
+
+Result (Test). 95.01% accuracy (macro F1 ≈ 0.95). This confirms that frozen DeiT representations transfer strongly to CIFAR-10 with minimal task-specific parameters.
+
+Type 2 — Partial Fine-Tune (Last Block + Norm + Head)
+
+Goal. Trade a modest increase in trainable capacity for better alignment of high-level features to CIFAR-10.
+
+Setup.
+
+Start from the same ImageNet-pretrained DeiT-Base; freeze all layers.
+
+Unfreeze only: the last transformer block (blocks[-1]), the final LayerNorm (model.norm), and the classification head.
+
+Batch size = 64, epochs = 40, early stopping patience = 5.
+
+Discriminative LRs. AdamW with parameter groups: last block and norm 5e-5, head 1e-4; weight decay = 0.01; label smoothing = 0.1. Cosine LR with warmup.
+
+Capacity. Total params: 85,806,346; trainable: 7,097,098.
+
+Result (Test). 97.15% accuracy (macro F1 ≈ 0.97). Compared with Type 1, carefully unfreezing the final stage substantially improves performance while keeping compute and overfitting risk controlled.
+
+Type 3 — End-to-End Fine-Tuning
+
+Goal. Fully adapt the representation to the target dataset.
+
+Setup.
+
+Initialize ImageNet-pretrained DeiT-Base; unfreeze all layers and fine-tune end-to-end.
+
+Batch size = 64, epochs = 40, early stopping patience = 5.
+
+Optimizer/Loss/Schedule. AdamW on all params (lr = 1e-4, weight decay = 0.01); label smoothing = 0.1. Cosine LR with warmup.
+
+Capacity. Total/Trainable params: 85,806,346.
+
+Result (Test). 97.36% accuracy (macro F1 ≈ 0.97), the best among the three regimes, with small but consistent gains over partial fine-tuning.
+
+Comparison & Takeaways
+
+Data split/validation usage. All models used the same stratified 80/20 train/validation split for model selection and early stopping; the test set remained untouched until final evaluation.
+
+Performance vs. trainable parameters.
+
+Linear probe achieves strong results with ~7.7K trainable params (95.01%).
+
+Partial fine-tuning adds ~7.1M trainable params, yielding a large jump to 97.15%.
+
+Full fine-tuning (all 85.8M params trainable) provides a smaller additional gain to 97.36%.
+
+Regularization/optimization details. Label smoothing (0.1) and weight decay (0.01) were beneficial when backbone layers were trainable (Types 2–3), while the linear probe favored no label smoothing and a higher head LR.
+
+Practical guidance. If compute or overfitting is a concern, Type 2 offers an excellent trade-off. When maximum accuracy is the priority and resources allow, Type 3 is preferred. Type 1 is ideal for rapid baselines and low-resource scenarios.
 
 
+## Deit On Ferplus
 
-The fine-tuned DeiT model learned robust expression features even with class imbalance.
 
+My Three DeiT Models
 
+Type 1 — Linear Probe (Backbone Frozen)
+
+I loaded DeiT-Base with ImageNet weights and froze the entire backbone. Only the final classification head (768 to 8) was trained. I used AdamW with learning rate 5e-3, label smoothing 0.1, cosine learning rate schedule with warmup, 20 epochs, and early stopping. This evaluated the pretrained DeiT representation without modifying its features.
+
+Results for Type 1
+Validation Accuracy: about 70 percent
+Test Accuracy: 68.31 percent
+This was far stronger than AlexNet’s linear probe, showing the power of transformer-based representations.
+
+Type 2 — Frozen DeiT Features With Linear SVM
+
+I evaluated DeiT as a pure feature extractor by setting num_classes=0. This outputs the 768-dimensional CLS token embedding for each image.
+
+I extracted embeddings for:
+Train: 22,708 images
+Validation: 5,678 images
+Test: 7,099 images
+
+Then I trained a Linear SVM with StandardScaler and LinearSVC(C=1), max iterations = 20000.
+
+Results for Type 2
+Validation Accuracy: 69.00 percent
+Test Accuracy: 67.47 percent
+Performance was similar to the linear probe, showing that DeiT CLS embeddings are highly separable.
+
+Type 3 — Full Fine-Tuning (Best Model)
+
+I loaded DeiT-Base with ImageNet weights, replaced the classifier with an 8-class head, and fine-tuned the entire backbone. I used AutoAugment, Random Erasing, horizontal flips, and a modern training recipe: AdamW (lr = 1e-4, wd = 0.01), label smoothing 0.1, mixed precision, cosine schedule with warmup, and early stopping.
+
+Results for Type 3
+Validation Accuracy: 85.28 percent
+Test Accuracy: 83.98 percent
+This was the best performance across all experiments.
+
+Class-wise performance:
+Happiness, Neutral, Surprise: strong
+Sadness, Anger: moderate
+Contempt, Disgust: weak due to very small sample sizes
+
+AutoML Search Space Used
+
+To tune efficiently on Colab, I used small, practical hyperparameter grids:
+
+Learning Rates: 5e-3, 1e-3, 1e-4
+Epochs: 10, 20, 40
+Batch Size: 32, 64
+Augmentation strength: AutoAugment ON/OFF
+Random Erasing: p = 0.1, 0.2, 0.3
+Optimizers: AdamW, optional SGD with momentum
+
+This allowed quick but meaningful exploration without running out of Colab RAM or compute time.
+
+Classifier Integration After Fine-Tuning
+
+After fine-tuning, I extracted pre-logits embeddings and trained classical classifiers:
+
+Linear SVM
+Logistic Regression
+k-Nearest Neighbors
+Random Forest
+
+Random Forest and k-NN performed almost as well as the fine-tuned DeiT model, showing that the learned representations were linearly separable and high quality.
+
+Final Interpretation
+
+Full fine-tuning (Type 3) was by far the best model, reaching about 84 percent test accuracy.
+The linear probe and SVM models both performed around 68 percent.
+All DeiT models greatly outperformed AlexNet-based models.
+The fine-tuned DeiT model learned robust and expressive features even in the presence of severe class imbalance.
 
 
